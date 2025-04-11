@@ -8,3 +8,5 @@ Pillow
 PyPDF2
 pdf2image
 mlflow
+psycopg2-binary  
+minio

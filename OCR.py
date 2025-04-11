@@ -12,24 +12,81 @@ import os
 import PyPDF2
 from pdf2image import convert_from_bytes
 import json
-
-# Create directories to save files
-output_dir = "./ocr_output"
-original_dir = os.path.join(output_dir, "originals")
-annotated_dir = os.path.join(output_dir, "annotated")
-
-os.makedirs(original_dir, exist_ok=True)
-os.makedirs(annotated_dir, exist_ok=True)
-
-# Set up MLflow
-mlflow.set_tracking_uri("file://./mlruns")
-mlflow.set_experiment("TextDetectionAPI")
+import psycopg2
+from minio import Minio
+from minio.error import S3Error
 
 # Initialize the EasyOCR reader
 reader = easyocr.Reader(['en'], gpu=False)  # Set gpu=True if you have a GPU and CUDA installed
 
 # Initialize FastAPI app
 app = FastAPI(title="Text Detection API")
+
+# PostgreSQL configuration (from environment variables)
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "admin")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "ocr_db")
+
+# MinIO configuration (from environment variables)
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "miniopassword")
+MINIO_BUCKET = "ocr-bucket"
+
+# Set up MLflow
+mlflow.set_tracking_uri("file://./mlruns")
+mlflow.set_experiment("TextDetectionAPI")
+
+# Initialize MinIO client
+minio_client = Minio(
+    MINIO_ENDPOINT,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    secure=False  # Set to True if using HTTPS
+)
+
+# Create MinIO bucket if it doesn't exist
+try:
+    if not minio_client.bucket_exists(MINIO_BUCKET):
+        minio_client.make_bucket(MINIO_BUCKET)
+except S3Error as e:
+    print(f"Error creating MinIO bucket: {e}")
+
+# Initialize PostgreSQL connection
+def get_db_connection():
+    return psycopg2.connect(
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+        database=POSTGRES_DB
+    )
+
+# Create table for storing detections if it doesn't exist
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS detections (
+            id SERIAL PRIMARY KEY,
+            filename VARCHAR(255),
+            original_url VARCHAR(255),
+            annotated_url VARCHAR(255),
+            text TEXT,
+            confidence FLOAT,
+            bounding_box JSONB,
+            page_number INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+# Initialize the database on startup
+init_db()
 
 @app.get("/")
 async def root():
@@ -41,7 +98,6 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
     results = []
     total_detections = 0
     total_confidence = 0
-    all_detections = []  # For retraining
 
     with mlflow.start_run():
         # Log parameters in MLflow
@@ -59,10 +115,16 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
 
             print(f"\nProcessing file: {filename} (Type: {content_type})")
 
-            # Save the original file
-            original_path = os.path.join(original_dir, filename)
-            with open(original_path, 'wb') as f:
-                f.write(file_data)
+            # Upload the original file to MinIO
+            original_url = f"originals/{filename}"
+            minio_client.put_object(
+                MINIO_BUCKET,
+                original_url,
+                io.BytesIO(file_data),
+                length=len(file_data),
+                content_type=content_type
+            )
+            print(f"Uploaded original file to MinIO: {original_url}")
 
             # Check if the file is a PDF
             if content_type == "application/pdf":
@@ -123,11 +185,18 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
                                     bottom_right = detection["bounding_box"]["bottom_right"]
                                     cv2.rectangle(image_cv, top_left, bottom_right, (0, 255, 0), 2)
 
-                            # Save the annotated image for this page
+                            # Save the annotated image to MinIO
                             annotated_filename = f"{filename}_page_{page_num + 1}.png"
-                            annotated_path = os.path.join(annotated_dir, annotated_filename)
-                            Image.fromarray(cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)).save(annotated_path)
-                            print(f"Saved annotated image: {annotated_path}")
+                            annotated_url = f"annotated/{annotated_filename}"
+                            _, buffer = cv2.imencode(".png", image_cv)
+                            minio_client.put_object(
+                                MINIO_BUCKET,
+                                annotated_url,
+                                io.BytesIO(buffer.tobytes()),
+                                length=len(buffer),
+                                content_type="image/png"
+                            )
+                            print(f"Uploaded annotated image to MinIO: {annotated_url}")
 
                         # Use the last page image for the result
                         if images:
@@ -147,18 +216,25 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
                 }
                 results.append(result)
 
-                # Store detections for retraining
+                # Store detections in PostgreSQL
+                conn = get_db_connection()
+                cursor = conn.cursor()
                 for detection in detections:
-                    detection_entry = {
-                        "filename": filename,
-                        "original_path": original_path,
-                        "annotated_path": annotated_path if 'annotated_path' in locals() else None,
-                        "text": detection["text"],
-                        "confidence": detection["confidence"],
-                        "bounding_box": detection["bounding_box"],
-                        "page_number": detection["page_number"]
-                    }
-                    all_detections.append(detection_entry)
+                    cursor.execute("""
+                        INSERT INTO detections (filename, original_url, annotated_url, text, confidence, bounding_box, page_number)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        filename,
+                        original_url,
+                        annotated_url if 'annotated_url' in locals() else None,
+                        detection["text"],
+                        detection["confidence"],
+                        json.dumps(detection["bounding_box"]) if detection["bounding_box"] else None,
+                        detection["page_number"]
+                    ))
+                conn.commit()
+                cursor.close()
+                conn.close()
 
             else:
                 # Process image files
@@ -191,11 +267,17 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
                     bottom_right = detection["bounding_box"]["bottom_right"]
                     cv2.rectangle(image, top_left, bottom_right, (0, 255, 0), 2)
 
-                # Save the annotated image
-                annotated_filename = filename
-                annotated_path = os.path.join(annotated_dir, annotated_filename)
-                Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).save(annotated_path)
-                print(f"Saved annotated image: {annotated_path}")
+                # Save the annotated image to MinIO
+                annotated_url = f"annotated/{filename}"
+                _, buffer = cv2.imencode(".png", image)
+                minio_client.put_object(
+                    MINIO_BUCKET,
+                    annotated_url,
+                    io.BytesIO(buffer.tobytes()),
+                    length=len(buffer),
+                    content_type="image/png"
+                )
+                print(f"Uploaded annotated image to MinIO: {annotated_url}")
 
                 # Store the result
                 result = {
@@ -205,18 +287,25 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
                 }
                 results.append(result)
 
-                # Store detections for retraining
+                # Store detections in PostgreSQL
+                conn = get_db_connection()
+                cursor = conn.cursor()
                 for detection in detections:
-                    detection_entry = {
-                        "filename": filename,
-                        "original_path": original_path,
-                        "annotated_path": annotated_path,
-                        "text": detection["text"],
-                        "confidence": detection["confidence"],
-                        "bounding_box": detection["bounding_box"],
-                        "page_number": detection["page_number"]
-                    }
-                    all_detections.append(detection_entry)
+                    cursor.execute("""
+                        INSERT INTO detections (filename, original_url, annotated_url, text, confidence, bounding_box, page_number)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        filename,
+                        original_url,
+                        annotated_url,
+                        detection["text"],
+                        detection["confidence"],
+                        json.dumps(detection["bounding_box"]) if detection["bounding_box"] else None,
+                        detection["page_number"]
+                    ))
+                conn.commit()
+                cursor.close()
+                conn.close()
 
         # If return_images is true, convert images to base64
         if return_images:
@@ -238,7 +327,7 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
         mlflow.log_metric("average_confidence", average_confidence)
         mlflow.log_metric("num_files_processed", len(files))
 
-        # Log annotated images as artifacts in MLflow
+        # Log annotated images as artifacts in MLflow (if return_images is true)
         if return_images:
             for result in results:
                 if result.get("image_base64"):
@@ -247,13 +336,6 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
                     image_path = f"annotated_{result['filename']}"
                     image_pil.save(image_path)
                     mlflow.log_artifact(image_path)
-
-        # Save detections as JSON for retraining
-        detections_json_path = os.path.join(output_dir, "detections.json")
-        with open(detections_json_path, 'w') as f:
-            json.dump(all_detections, f, indent=4)
-        print(f"Saved detections for retraining: {detections_json_path}")
-        mlflow.log_artifact(detections_json_path)
 
         return {"status": "success", "results": results}
 
