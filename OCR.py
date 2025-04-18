@@ -1,262 +1,223 @@
-import base64
-import time
-from typing import List
-import cv2
-import easyocr
-import numpy as np
-from fastapi import FastAPI, File, UploadFile
-from PIL import Image
-import io
-import mlflow
 import os
-import PyPDF2
-from pdf2image import convert_from_bytes
+import io
 import json
-
-# Create directories to save files
-output_dir = "./ocr_output"
-original_dir = os.path.join(output_dir, "originals")
-annotated_dir = os.path.join(output_dir, "annotated")
-
-os.makedirs(original_dir, exist_ok=True)
-os.makedirs(annotated_dir, exist_ok=True)
-
-# Set up MLflow
-mlflow.set_tracking_uri("file://./mlruns")
-mlflow.set_experiment("TextDetectionAPI")
-
-# Initialize the EasyOCR reader
-reader = easyocr.Reader(['en'], gpu=False)  # Set gpu=True if you have a GPU and CUDA installed
+import time
+import base64
+import cv2
+import numpy as np
+from PIL import Image
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.exception_handlers import http_exception_handler
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from typing import List
+import mlflow
+import psycopg2
+from minio import Minio
+from minio.error import S3Error
+from ocr_model import detect_text_from_file
+import traceback
 
 # Initialize FastAPI app
-app = FastAPI(title="Text Detection API")
+app = FastAPI()
 
+# Set up MLflow experiment
+MLFLOW_EXPERIMENT_NAME = "OCR_Experiment"
+
+# Create or get the experiment
+try:
+    experiment = mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME)
+    if experiment is None:
+        experiment_id = mlflow.create_experiment(MLFLOW_EXPERIMENT_NAME)
+    else:
+        experiment_id = experiment.experiment_id
+except Exception as e:
+    print(f"Failed to initialize MLflow experiment: {str(e)}")
+    raise e
+
+# Environment variables
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", 5432))
+POSTGRES_USER = os.getenv("POSTGRES_USER", "admin")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "ocr_db")
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "miniopassword")
+MINIO_BUCKET = "ocr-bucket"
+
+# Initialize MinIO client
+minio_client = Minio(
+    MINIO_ENDPOINT,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    secure=False
+)
+
+# Ensure MinIO bucket exists
+try:
+    if not minio_client.bucket_exists(MINIO_BUCKET):
+        minio_client.make_bucket(MINIO_BUCKET)
+except S3Error as e:
+    print(f"Failed to initialize MinIO bucket: {str(e)}")
+    raise e
+
+# Initialize PostgreSQL connection
+try:
+    conn = psycopg2.connect(
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+        database=POSTGRES_DB
+    )
+    cursor = conn.cursor()
+
+    # Create table for detections if it doesn't exist
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS detections (
+            id SERIAL PRIMARY KEY,
+            filename VARCHAR(255),
+            original_url VARCHAR(255),
+            annotated_url VARCHAR(255),
+            text TEXT,
+            confidence FLOAT,
+            bounding_box JSONB,
+            page_number INTEGER,
+            is_embedded_image BOOLEAN,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+except Exception as e:
+    print(f"Failed to connect to PostgreSQL: {str(e)}")
+    raise e
+
+# Custom exception handler for unhandled exceptions
+@app.exception_handler(Exception)
+async def custom_exception_handler(request, exc):
+    print(f"Unhandled error: {str(exc)}")
+    print(traceback.format_exc())
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error", "error": str(exc)},
+    )
+
+# Root endpoint
 @app.get("/")
 async def root():
-    return {"message": "Bienvenue sur l'API de détection de texte ! Utilisez /detect-text-multiple/ pour uploader des images ou des PDFs."}
+    return {
+        "message": "Bienvenue sur l'API de détection de texte ! Utilisez /detect-text-multiple/ pour uploader des images ou des PDFs."
+    }
 
+# Endpoint to detect text from multiple files
 @app.post("/detect-text-multiple/")
-async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: float = 0.5, return_images: bool = False):
+async def detect_text_multiple(
+    files: List[UploadFile] = File(...),
+    threshold: float = 0.5,
+    return_images: bool = False
+):
     start_time = time.time()
     results = []
     total_detections = 0
     total_confidence = 0
-    all_detections = []  # For retraining
 
-    with mlflow.start_run():
-        # Log parameters in MLflow
+    # Start MLflow run with the specified experiment ID
+    with mlflow.start_run(experiment_id=experiment_id):
         mlflow.log_param("threshold", threshold)
+        mlflow.log_param("num_files", len(files))
         mlflow.log_param("return_images", return_images)
-        mlflow.log_param("languages", "en")
-        mlflow.log_param("contrast_ths", 0.1)
-        mlflow.log_param("adjust_contrast", 0.5)
 
         for file in files:
-            # Read the file
-            file_data = await file.read()
             filename = file.filename
-            content_type = file.content_type
 
-            print(f"\nProcessing file: {filename} (Type: {content_type})")
+            # Read file data
+            file_data = await file.read()
 
-            # Save the original file
-            original_path = os.path.join(original_dir, filename)
-            with open(original_path, 'wb') as f:
-                f.write(file_data)
+            # Save original file to MinIO
+            original_path = f"originals/{filename}"
+            minio_client.put_object(MINIO_BUCKET, original_path, io.BytesIO(file_data), len(file_data))
 
-            # Check if the file is a PDF
-            if content_type == "application/pdf":
-                # Extract text directly from the PDF (if possible)
-                try:
-                    pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_data))
-                    pdf_text = ""
-                    for page_num in range(len(pdf_reader.pages)):
-                        page = pdf_reader.pages[page_num]
-                        text = page.extract_text()
-                        if text:
-                            pdf_text += text
+            # Detect text using the EasyOCR model
+            detections, file_detections, file_confidence, image_base64 = detect_text_from_file(file_data, filename, threshold, return_images)
 
-                    print(f"Extracted text from PDF: {pdf_text[:100]}...")
+            # Update totals
+            total_detections += file_detections
+            total_confidence += file_confidence
 
-                    # If text was extracted directly, use it
-                    if pdf_text.strip():
-                        print("Using directly extracted text from PDF.")
-                        detections = [{"text": pdf_text, "confidence": 1.0, "bounding_box": None, "page_number": None}]
-                        total_detections += 1
-                        total_confidence += 1.0
-                        image = None  # No image to process
+            # Save detections to PostgreSQL and MinIO
+            for detection in detections:
+                # Prepare data for PostgreSQL
+                text = detection["text"]
+                confidence = detection["confidence"]
+                bounding_box = detection.get("bounding_box")
+                page_number = detection.get("page_number")
+                is_embedded_image = detection["is_embedded_image"]
+
+                # Insert detection into PostgreSQL
+                cursor.execute(
+                    """
+                    INSERT INTO detections (filename, original_url, text, confidence, bounding_box, page_number, is_embedded_image)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (filename, original_path, text, confidence, json.dumps(bounding_box) if bounding_box else None, page_number, is_embedded_image)
+                )
+                detection_id = cursor.fetchone()[0]
+                conn.commit()
+
+                # If there is an image to annotate (i.e., not a direct text extraction from PDF)
+                if image_base64 and return_images:
+                    # Decode base64 image to annotate
+                    image_bytes = base64.b64decode(image_base64)
+                    image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+
+                    # Save annotated image to MinIO
+                    if is_embedded_image:
+                        annotated_filename = f"{filename}_page_{page_number}_embedded_{len([d for d in detections if d['page_number'] == page_number and d['is_embedded_image']])}.png"
+                    elif page_number:
+                        annotated_filename = f"{filename}_page_{page_number}.png"
                     else:
-                        # If the PDF is scanned (no selectable text), convert to images
-                        print("No selectable text found. Converting PDF to images for OCR...")
-                        images = convert_from_bytes(file_data)
-                        print(f"Converted PDF to {len(images)} image(s).")
-                        detections = []
-                        for page_num, image in enumerate(images):
-                            # Convert PIL image to OpenCV format
-                            image_np = np.array(image)
-                            image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+                        annotated_filename = filename
+                    annotated_path = f"annotated/{annotated_filename}"
 
-                            # Perform text detection with EasyOCR
-                            ocr_results = reader.readtext(image_cv, contrast_ths=0.1, adjust_contrast=0.5)
-
-                            # Process detections
-                            for (bbox, text, confidence) in ocr_results:
-                                if confidence >= threshold:
-                                    top_left = [int(bbox[0][0]), int(bbox[0][1])]
-                                    bottom_right = [int(bbox[2][0]), int(bbox[2][1])]
-                                    detections.append({
-                                        "text": text,
-                                        "confidence": confidence,
-                                        "bounding_box": {
-                                            "top_left": top_left,
-                                            "bottom_right": bottom_right
-                                        },
-                                        "page_number": page_num + 1
-                                    })
-                                    total_detections += 1
-                                    total_confidence += confidence
-
-                            # Draw bounding boxes on the image
-                            for detection in detections:
-                                if detection["page_number"] == page_num + 1:
-                                    top_left = detection["bounding_box"]["top_left"]
-                                    bottom_right = detection["bounding_box"]["bottom_right"]
-                                    cv2.rectangle(image_cv, top_left, bottom_right, (0, 255, 0), 2)
-
-                            # Save the annotated image for this page
-                            annotated_filename = f"{filename}_page_{page_num + 1}.png"
-                            annotated_path = os.path.join(annotated_dir, annotated_filename)
-                            Image.fromarray(cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)).save(annotated_path)
-                            print(f"Saved annotated image: {annotated_path}")
-
-                        # Use the last page image for the result
-                        if images:
-                            image = image_cv
-                        else:
-                            image = None
-                except Exception as e:
-                    print(f"Error processing PDF {filename}: {str(e)}")
-                    detections = [{"text": f"Error processing PDF: {str(e)}", "confidence": 0.0, "bounding_box": None, "page_number": None}]
-                    image = None
-
-                # Store the result for the PDF
-                result = {
-                    "filename": filename,
-                    "detections": detections,
-                    "image": image
-                }
-                results.append(result)
-
-                # Store detections for retraining
-                for detection in detections:
-                    detection_entry = {
-                        "filename": filename,
-                        "original_path": original_path,
-                        "annotated_path": annotated_path if 'annotated_path' in locals() else None,
-                        "text": detection["text"],
-                        "confidence": detection["confidence"],
-                        "bounding_box": detection["bounding_box"],
-                        "page_number": detection["page_number"]
-                    }
-                    all_detections.append(detection_entry)
-
-            else:
-                # Process image files
-                image = cv2.imdecode(np.frombuffer(file_data, np.uint8), cv2.IMREAD_COLOR)
-
-                # Perform text detection
-                ocr_results = reader.readtext(image, contrast_ths=0.1, adjust_contrast=0.5)
-
-                # Process detections
-                detections = []
-                for (bbox, text, confidence) in ocr_results:
-                    if confidence >= threshold:
-                        top_left = [int(bbox[0][0]), int(bbox[0][1])]
-                        bottom_right = [int(bbox[2][0]), int(bbox[2][1])]
-                        detections.append({
-                            "text": text,
-                            "confidence": confidence,
-                            "bounding_box": {
-                                "top_left": top_left,
-                                "bottom_right": bottom_right
-                            },
-                            "page_number": None
-                        })
-                        total_detections += 1
-                        total_confidence += confidence
-
-                # Draw bounding boxes on the image
-                for detection in detections:
-                    top_left = detection["bounding_box"]["top_left"]
-                    bottom_right = detection["bounding_box"]["bottom_right"]
-                    cv2.rectangle(image, top_left, bottom_right, (0, 255, 0), 2)
-
-                # Save the annotated image
-                annotated_filename = filename
-                annotated_path = os.path.join(annotated_dir, annotated_filename)
-                Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).save(annotated_path)
-                print(f"Saved annotated image: {annotated_path}")
-
-                # Store the result
-                result = {
-                    "filename": filename,
-                    "detections": detections,
-                    "image": image
-                }
-                results.append(result)
-
-                # Store detections for retraining
-                for detection in detections:
-                    detection_entry = {
-                        "filename": filename,
-                        "original_path": original_path,
-                        "annotated_path": annotated_path,
-                        "text": detection["text"],
-                        "confidence": detection["confidence"],
-                        "bounding_box": detection["bounding_box"],
-                        "page_number": detection["page_number"]
-                    }
-                    all_detections.append(detection_entry)
-
-        # If return_images is true, convert images to base64
-        if return_images:
-            for result in results:
-                image = result["image"]
-                if image is not None:
                     _, buffer = cv2.imencode(".png", image)
-                    image_base64 = base64.b64encode(buffer).decode("utf-8")
-                    result["image_base64"] = image_base64
-                else:
-                    result["image_base64"] = None
-                del result["image"]
+                    minio_client.put_object(MINIO_BUCKET, annotated_path, io.BytesIO(buffer.tobytes()), len(buffer))
 
-        # Log metrics in MLflow
+                    # Update detection in PostgreSQL with annotated URL
+                    cursor.execute(
+                        """
+                        UPDATE detections
+                        SET annotated_url = %s
+                        WHERE id = %s
+                        """,
+                        (annotated_path, detection_id)
+                    )
+                    conn.commit()
+
+            # Prepare result for this file
+            result = {
+                "filename": filename,
+                "detections": detections,
+                "image_base64": image_base64 if return_images else None
+            }
+            results.append(result)
+
+        # Log metrics to MLflow
         processing_time = time.time() - start_time
         average_confidence = total_confidence / total_detections if total_detections > 0 else 0
         mlflow.log_metric("processing_time", processing_time)
         mlflow.log_metric("total_detections", total_detections)
         mlflow.log_metric("average_confidence", average_confidence)
-        mlflow.log_metric("num_files_processed", len(files))
 
-        # Log annotated images as artifacts in MLflow
-        if return_images:
-            for result in results:
-                if result.get("image_base64"):
-                    image_data = base64.b64decode(result["image_base64"])
-                    image_pil = Image.open(io.BytesIO(image_data))
-                    image_path = f"annotated_{result['filename']}"
-                    image_pil.save(image_path)
-                    mlflow.log_artifact(image_path)
+    # Return response
+    return {
+        "status": "success",
+        "results": results
+    }
 
-        # Save detections as JSON for retraining
-        detections_json_path = os.path.join(output_dir, "detections.json")
-        with open(detections_json_path, 'w') as f:
-            json.dump(all_detections, f, indent=4)
-        print(f"Saved detections for retraining: {detections_json_path}")
-        mlflow.log_artifact(detections_json_path)
-
-        return {"status": "success", "results": results}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# Cleanup on shutdown
+@app.on_event("shutdown")
+def shutdown_event():
+    cursor.close()
+    conn.close()
