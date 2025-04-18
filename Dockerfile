@@ -11,10 +11,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY OCR.py .
-<<<<<<< HEAD
+
 COPY ocr_model.py .
-=======
->>>>>>> a48b572f4a8d2ba73e80ab60d04f821a323ed455
+
 
 EXPOSE 8000
 
